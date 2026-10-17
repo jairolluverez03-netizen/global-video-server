@@ -33,19 +33,76 @@ def normalize_audio(source, dest):
     return duration
 
 
-def synthesize(script, dest):
+def stream_process(args, progress, *, input_text=None, timeout=1800):
+    import tempfile
+    import threading
+    with tempfile.TemporaryFile() as errors:
+        proc = subprocess.Popen([str(a) for a in args], stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=errors, text=True, bufsize=1)
+        timer = threading.Timer(timeout, proc.kill)
+        timer.start()
+        try:
+            if input_text is not None:
+                proc.stdin.write(input_text)
+                proc.stdin.close()
+            for line in proc.stdout:
+                progress(line.strip())
+            if proc.wait():
+                errors.seek(0)
+                raise RuntimeError(errors.read().decode(errors='replace')[-3000:])
+        finally:
+            timer.cancel()
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+
+def synthesize(script, dest, progress=lambda n, total: None):
+    import textwrap
     model = Path(os.getenv('PIPER_MODEL', 'models/es_ES-davefx-medium.onnx')).resolve()
     if not model.is_file() or not Path(str(model) + '.json').is_file():
-        raise ValueError('Falta instalar la voz Piper. Ejecuta el paso de descarga indicado en LEEME.md.')
-    run([sys.executable, '-m', 'piper', '-m', model, '-f', dest, '--', script], timeout=1800)
+        raise ValueError('La voz no está instalada en el servidor.')
+    chunks = [part for sentence in re.split(r'(?<=[.!?])\s+|\n+', script.strip())
+              for part in textwrap.wrap(sentence, width=350) if part.strip()]
+    helper = r"""
+import sys,json,wave
+import onnxruntime as ort
+from piper.voice import PiperVoice
+from piper.config import PiperConfig
+model,dest=sys.argv[1:]
+parts=json.load(sys.stdin)
+options=ort.SessionOptions()
+options.intra_op_num_threads=1
+options.inter_op_num_threads=1
+options.execution_mode=ort.ExecutionMode.ORT_SEQUENTIAL
+voice=PiperVoice(session=ort.InferenceSession(model,sess_options=options,providers=['CPUExecutionProvider']),config=PiperConfig.from_dict(json.load(open(model+'.json'))))
+with wave.open(dest,'wb') as out:
+ out.setnchannels(1);out.setsampwidth(2);out.setframerate(voice.config.sample_rate)
+ for i,part in enumerate(parts):
+  for audio in voice.synthesize(part):
+   out.writeframes(audio.audio_int16_bytes)
+  print(i+1,flush=True)
+"""
+    def update(line):
+        if line.isdigit():
+            progress(int(line), len(chunks))
+    stream_process([sys.executable, '-c', helper, model, dest], update, input_text=json.dumps(chunks), timeout=1800)
 
 
-def presentation(image, audio, dest):
-    # This is an image presentation, not a generated talking face.
-    run(['ffmpeg', '-nostdin', '-y', '-v', 'error', '-loop', '1', '-i', image, '-i', audio,
+def presentation(image, audio, dest, duration, progress=lambda value: None):
+    # Image presentation; progress comes from actual encoded timestamps.
+    def update(line):
+        if line.startswith('out_time_us='):
+            try:
+                progress(min(95, 25 + int(70 * int(line.split('=',1)[1]) / 1000000 / duration)))
+            except ValueError:
+                pass
+    stream_process(['ffmpeg', '-nostdin', '-y', '-v', 'error', '-filter_threads', '1',
+         '-loop', '1', '-i', image, '-i', audio,
          '-vf', "scale=640:680:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=0x172c60,setsar=1",
-         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-pix_fmt', 'yuv420p',
-         '-r', '15', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-movflags', '+faststart', dest])
+         '-c:v', 'libx264', '-threads', '1', '-preset', 'ultrafast', '-tune', 'stillimage', '-pix_fmt', 'yuv420p',
+         '-r', '15', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-movflags', '+faststart',
+         '-progress', 'pipe:1', '-nostats', dest], update, timeout=7200)
 
 
 def sadtalker(image, audio, dest, job_dir, progress):
@@ -148,18 +205,20 @@ def get(job):
 def process(job):
     folder = DATA / job['id']
     try:
-        change(job['id'], status='processing', progress=5)
+        change(job['id'], status='processing', progress=5, message='Cargando la voz española…')
         raw = folder / 'input-audio'
         if not raw.exists():
             raw = folder / 'speech.wav'
-            synthesize((folder / 'script.txt').read_text(), raw)
+            synthesize((folder / 'script.txt').read_text(), raw, lambda n,total: change(job['id'], progress=5 + int(19*n/total), message=f'Creando narración: fragmento {n} de {total}.'))
+        change(job['id'], message='Preparando el audio…')
         duration = normalize_audio(raw, folder / 'audio.wav')
-        change(job['id'], duration=duration, progress=25)
+        change(job['id'], duration=duration, progress=25, message='Generando el archivo MP4…')
         if job['engine'] == 'sadtalker':
             sadtalker(folder / 'image.png', folder / 'audio.wav', folder / 'video.mp4', folder,
                       lambda v: change(job['id'], progress=v))
         else:
-            presentation(folder / 'image.png', folder / 'audio.wav', folder / 'video.mp4')
+            presentation(folder / 'image.png', folder / 'audio.wav', folder / 'video.mp4', duration, lambda n: change(job['id'], progress=n, message='Generando el archivo MP4…'))
+        change(job['id'], progress=98, message='Verificando audio y video…')
         actual = float(probe(folder / 'video.mp4')['format']['duration'])
         if abs(actual - duration) > max(2, duration * .02):
             raise RuntimeError('La duración del video no coincide con el audio.')
