@@ -97,7 +97,10 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request, Response
+import hashlib
+import base64
+from collections import OrderedDict
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from PIL import Image, UnidentifiedImageError
@@ -198,9 +201,87 @@ if origins:
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=['GET', 'POST'], allow_headers=['Authorization'])
 
 
-def auth(authorization: str = Header(default='')):
-    if not hmac.compare_digest(authorization, 'Bearer ' + TOKEN):
-        raise HTTPException(401, 'Token incorrecto')
+LOGIN_USER = os.getenv('LOGIN_USERNAME', 'jairo')
+PASSWORD_HASH = os.getenv('LOGIN_PASSWORD_HASH', '')
+COOKIE = '__Host-global_session'
+SESSION_SECONDS = 8 * 3600
+attempts = OrderedDict()
+
+
+def same_origin(request):
+    origin = request.headers.get('origin')
+    if origin and origin != 'https://' + request.headers.get('host', ''):
+        raise HTTPException(403, 'Origen no permitido')
+
+
+def signature(payload):
+    key = (TOKEN + PASSWORD_HASH).encode()
+    return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+
+
+def valid_session(value):
+    try:
+        payload, sig = value.rsplit('.', 1)
+        username, expiry, nonce = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+        return (hmac.compare_digest(sig, signature(payload)) and username == LOGIN_USER
+                and time.time() < expiry <= time.time() + SESSION_SECONDS + 60)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def auth(request: Request, authorization: str = Header(default='')):
+    # Server integrations retain their separate secret; it is never sent to the browser.
+    if authorization and hmac.compare_digest(authorization, 'Bearer ' + TOKEN):
+        return
+    if not valid_session(request.cookies.get(COOKIE, '')):
+        raise HTTPException(401, 'Inicia sesión para continuar.')
+    if request.method not in ('GET', 'HEAD'):
+        same_origin(request)
+
+
+@app.post('/api/login')
+def login(request: Request, response: Response, username: str = Form(...), password: str = Form(...)):
+    same_origin(request)
+    address = request.client.host if request.client else 'unknown'
+    now = time.time()
+    count, until = attempts.get(address, (0, now + 300))
+    if now > until:
+        count, until = 0, now + 300
+    if count >= 5:
+        raise HTTPException(429, 'Demasiados intentos. Espera cinco minutos.')
+    attempts[address] = (count + 1, until)
+    attempts.move_to_end(address)
+    if len(attempts) > 10000:
+        attempts.popitem(last=False)
+    if len(password) > 256 or len(username) > 160:
+        raise HTTPException(401, 'Usuario o contraseña incorrectos.')
+    try:
+        rounds, salt, expected = PASSWORD_HASH.split('$')
+        supplied = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), int(rounds)).hex()
+        correct = hmac.compare_digest(supplied, expected)
+    except (ValueError, TypeError):
+        raise HTTPException(503, 'El acceso está pendiente de configuración.')
+    if len(password) > 256 or not (hmac.compare_digest(username, LOGIN_USER) and correct):
+        raise HTTPException(401, 'Usuario o contraseña incorrectos.')
+    attempts.pop(address, None)
+    payload = base64.urlsafe_b64encode(json.dumps([LOGIN_USER, int(now) + SESSION_SECONDS, secrets.token_hex(16)]).encode()).decode().rstrip('=')
+    response.set_cookie(COOKIE, payload + '.' + signature(payload), max_age=SESSION_SECONDS,
+                        secure=True, httponly=True, samesite='strict', path='/')
+    response.headers['Cache-Control'] = 'no-store'
+    return {'username': LOGIN_USER}
+
+
+@app.get('/api/session', dependencies=[Depends(auth)])
+def session(response: Response):
+    response.headers['Cache-Control'] = 'no-store'
+    return {'username': LOGIN_USER}
+
+
+@app.post('/api/logout')
+def logout(request: Request, response: Response):
+    same_origin(request)
+    response.delete_cookie(COOKIE, secure=True, httponly=True, samesite='strict', path='/')
+    return {'ok': True}
 
 
 @app.get('/')
