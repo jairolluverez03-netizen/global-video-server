@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: global-video-server
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: VIDEO_API_TOKEN
+        generateValue: true
+      - key: VIDEO_DATA
+        value: /data
+      - key: PIPER_MODEL
+        value: /models/es_ES-davefx-medium.onnx
