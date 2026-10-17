@@ -1,51 +1,38 @@
 # Global Video Server
 
-Servidor independiente para producir MP4 con audio. Preparado para alojarse online en un contenedor; no es necesario instalar programas en el equipo del usuario final.
+Servidor independiente para crear MP4 con una imagen y narración española. Se usa desde el navegador y no está conectado a Global Training.
 
-## Estado real
+## Estado y límites
 
-- Código de API, interfaz web y exportación MP4 implementados.
-- Voz neural local con Piper, descargada al arrancar el servicio.
-- Motor `presentation`: imagen y narración. No anima labios ni cuerpo.
-- Adaptador opcional `sadtalker`: animación facial por segmentos de 30 segundos y unión del resultado. No anima el cuerpo completo. Requiere instalar sus dependencias y pesos en un entorno separado. No se ha probado ese motor ni la detección de rostro de este personaje.
-- Máximo de audio: 30 minutos. Un video de 10 minutos requiere un guion/audio de esa duración; no se rellena con repeticiones.
-- Todavía no hay servidor publicado. El alojamiento se configura tras conectar la cuenta del proveedor. El servicio puede generar cargos de procesamiento, disco y transferencia.
+- API, interfaz web, síntesis Piper y exportación MP4 implementadas.
+- El despliegue en Render utiliza el plan gratuito, sin disco persistente. Los trabajos y videos pueden perderse al reiniciar o desplegar: descarga los resultados.
+- El motor presentation combina imagen fija y audio; no mueve labios ni cuerpo.
+- El adaptador opcional SadTalker no está instalado ni probado en este despliegue. Requiere dependencias y modelos aparte; no garantiza resultados con caricaturas ni anima el cuerpo.
+- Máximo aceptado: 30 minutos de audio. Diez minutos requieren una narración de esa duración. La capacidad para trabajos largos debe medirse en el servidor gratuito.
 
-## Alojamiento online
+## Despliegue
 
-El proyecto contiene Dockerfile y render.yaml para un servicio de contenedor con disco persistente. El arranque descarga `es_ES-davefx-medium` y sirve la interfaz y la API por el puerto que asigne el proveedor. Verificar la disponibilidad y licencia de la voz/modelo antes de uso comercial.
+Dockerfile instala FFmpeg, las dependencias y la voz es_ES-davefx-medium durante la construcción. Inicia uvicorn server:app con un worker y el puerto PORT del proveedor. No necesita scripts/start.sh.
 
-1. Conectar el proveedor de alojamiento y seleccionar una cuenta/proyecto.
-2. Guardar este código en un repositorio del usuario y enlazarlo al servicio Docker.
-3. Crear el disco persistente montado en `/data`; confirmar el plan y precio.
-4. Guardar un secreto aleatorio `VIDEO_API_TOKEN` de al menos 24 caracteres. Nunca incluirlo en el código público ni en la URL.
-5. Ejecutar `sh scripts/start.sh` como comando de inicio. Solo un worker y una instancia, porque la cola utiliza SQLite y un trabajador local.
-6. Verificar `/health`, abrir la interfaz y consultar capacidades con el token.
-7. Generar un clip breve con audio y verificar imagen, audio y duración antes de un video largo.
-8. Conectar el frontend de Global Video Studio al servidor mediante HTTPS con autorización. Esta conexión aún no está incorporada al frontend existente. No se ha conectado Global Training.
+Configurar VIDEO_API_TOKEN como secreto aleatorio de al menos 24 caracteres, VIDEO_DATA=/data y PIPER_MODEL=/models/es_ES-davefx-medium.onnx. Nunca publicar el token ni incluirlo en una URL.
 
-El servicio no debe desplegarse como función breve o como sitio estático. La animación facial pesada requiere CPU/memoria suficientes o una máquina GPU; se debe medir el consumo con una muestra antes de escalar.
+Abrir la interfaz del servidor e introducir el token para consultar capacidades, enviar un guion o audio y descargar el MP4. Verificar primero un clip corto con imagen, voz y duración.
 
 ## API
 
-`Authorization: Bearer <VIDEO_API_TOKEN>` es obligatorio salvo en `/`, `/avatar`, `/health` y la documentación de API.
+Authorization: Bearer <VIDEO_API_TOKEN> es obligatorio para /api/*.
 
-- GET `/api/capabilities`: motores configurados.
-- POST `/api/jobs`: multipart `title`, `script`, `engine` (`presentation` o `sadtalker`), `image` opcional y `audio` opcional. Si se aporta audio, sustituye la síntesis.
-- GET `/api/jobs`: últimos 30 trabajos.
-- GET `/api/jobs/{id}`: estado, progreso y duración real.
-- GET `/api/jobs/{id}/video`: descargar MP4 terminado.
+- GET /health: salud pública.
+- GET /api/capabilities: motores disponibles.
+- POST /api/jobs: multipart title, script, engine (presentation o sadtalker), image y audio opcionales.
+- GET /api/jobs: últimos trabajos.
+- GET /api/jobs/{id}: estado y duración.
+- GET /api/jobs/{id}/video: MP4 terminado.
 
-Los trabajos y medios permanecen en `/data`. Los trabajos interrumpidos se marcan fallidos al reiniciar; los pendientes se conservan. No hay política automática de borrado ni servicio multiusuario: es un servidor privado de un solo propietario. No reutilizar este token para clientes diferentes.
+Un solo propietario, una instancia y un trabajador. Sin política automática de borrado. Los medios se guardan en almacenamiento efímero /data.
 
-## SadTalker opcional
+## Modelos opcionales
 
-Instalar desde el repositorio oficial y seguir sus instrucciones para entorno y modelos. Configurar `SADTALKER_DIR` y `SADTALKER_PYTHON` con rutas del servidor; `SADTALKER_CPU=1` para CPU o `0` para GPU compatible. El adaptador utiliza `inference.py --preprocess full --still --size 256`. El entorno Docker base no incluye este modelo. No promete movimientos corporales ni un resultado natural garantizado en caricaturas.
+SadTalker requiere SADTALKER_DIR y SADTALKER_PYTHON; SADTALKER_CPU=1 para CPU. Procesa segmentos de 30 segundos. No viene incluido en esta imagen Docker.
 
-## Fuentes técnicas
-
-- https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/CLI.md
-- https://github.com/OpenTalker/SadTalker
-- https://github.com/OpenTalker/SadTalker/blob/main/inference.py
-
-Revisar las licencias de software y los modelos para el uso previsto.
+Fuentes: https://github.com/OHF-Voice/piper1-gpl y https://github.com/OpenTalker/SadTalker. Revisar las licencias del software y los modelos para el uso previsto.
